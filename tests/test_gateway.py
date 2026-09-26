@@ -89,12 +89,11 @@ def test_business_error_not_failed_over_and_normalized():
 
 
 def test_circuit_open_skips_to_backup_even_for_non_idempotent():
-    gw, a, b, _ = build([Behavior("unavailable")] * 3, [Behavior("unavailable")] * 3)
-    # 先熔断 a（3 次连续失败；b 也不可用，请求整体失败）
+    gw, a, b, _ = build([Behavior("unavailable")] * 3, [Behavior("ok", body={"from": "b"})])
+    # 用非幂等 POST 熔断 a（不触发故障切换，b 的熔断计数不受影响）
     for _ in range(3):
         with pytest.raises(GatewayError):
-            gw.handle(GatewayRequest(Caller("c1"), Method.GET, "/items/1"))
-    b.set_behaviors([Behavior("ok", body={"from": "b"})])
+            gw.handle(GatewayRequest(Caller("c1"), Method.POST, "/items"))
     # 非幂等请求：a 熔断未发出请求，可安全走 b
     resp = gw.handle(GatewayRequest(Caller("c1"), Method.POST, "/items"))
     log.info("a circuit open -> POST routed to b=%s, a_calls=%d", resp.upstream, a.call_count)
