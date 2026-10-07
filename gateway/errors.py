@@ -10,6 +10,7 @@ class ErrorCategory(enum.Enum):
     VERSION_NOT_SATISFIED = "version_not_satisfied"
     RATE_LIMITED = "rate_limited"
     QUOTA_EXHAUSTED = "quota_exhausted"
+    UPSTREAM_CAPACITY_EXCEEDED = "upstream_capacity_exceeded"
     CIRCUIT_OPEN = "circuit_open"
     UPSTREAM_TIMEOUT = "upstream_timeout"
     UPSTREAM_UNAVAILABLE = "upstream_unavailable"
