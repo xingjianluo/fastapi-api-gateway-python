@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 import threading
+from collections.abc import Callable
 
 from gateway.clock import Clock, SystemClock
 from gateway.errors import ErrorCategory, GatewayError
@@ -55,6 +56,19 @@ class CircuitBreakerRegistry:
         self._clock: Clock = clock or SystemClock()
         self._lock = threading.Lock()
         self._circuits: dict[str, _Circuit] = {}
+        self._listeners: list[Callable[[str, CircuitState], None]] = []
+
+    def add_listener(self, listener: Callable[[str, CircuitState], None]) -> None:
+        """注册状态变更监听：进入 OPEN 或 CLOSED 时回调（上游名, 新状态）。
+
+        回调在注册表锁外触发，监听器可以安全地回调注册表。
+        """
+        with self._lock:
+            self._listeners.append(listener)
+
+    def _notify(self, upstream: Upstream, state: CircuitState) -> None:
+        for listener in self._listeners:
+            listener(upstream.name, state)
 
     def _circuit_for(self, upstream: Upstream) -> _Circuit:
         return self._circuits.setdefault(upstream.name, _Circuit())
@@ -89,12 +103,16 @@ class CircuitBreakerRegistry:
         """成功：关闭熔断并清零失败计数（半开探测成功即恢复）。"""
         with self._lock:
             circuit = self._circuit_for(upstream)
+            was = circuit.state
             circuit.state = CircuitState.CLOSED
             circuit.consecutive_failures = 0
             circuit.in_flight_probes = 0
+        if was is not CircuitState.CLOSED:
+            self._notify(upstream, CircuitState.CLOSED)
 
     def on_failure(self, upstream: Upstream) -> None:
         """失败：CLOSED 累计连续失败；HALF_OPEN 探测失败立即重新熔断。"""
+        opened = False
         with self._lock:
             circuit = self._circuit_for(upstream)
             if circuit.state is CircuitState.HALF_OPEN:
@@ -102,11 +120,15 @@ class CircuitBreakerRegistry:
                 circuit.opened_at = self._clock.now()
                 circuit.in_flight_probes = 0
                 circuit.consecutive_failures = self._config.failure_threshold
-                return
-            circuit.consecutive_failures += 1
-            if circuit.consecutive_failures >= self._config.failure_threshold:
-                circuit.state = CircuitState.OPEN
-                circuit.opened_at = self._clock.now()
+                opened = True
+            else:
+                circuit.consecutive_failures += 1
+                if circuit.consecutive_failures >= self._config.failure_threshold:
+                    circuit.state = CircuitState.OPEN
+                    circuit.opened_at = self._clock.now()
+                    opened = True
+        if opened:
+            self._notify(upstream, CircuitState.OPEN)
 
     def state(self, upstream: Upstream) -> CircuitState:
         with self._lock:

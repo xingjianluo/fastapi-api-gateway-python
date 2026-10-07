@@ -15,11 +15,21 @@ uv run python main.py    # 本地启动网关，监听 127.0.0.1:8000
 
 ```bash
 curl -H 'X-Caller-Id: demo' -H 'X-Accept-Versions: 1,2' http://127.0.0.1:8000/items/1
-# => {"upstream":"items-v2a","version":2,"body":{"svc":"v2a"}}
+# => {"upstream":"items-v1","version":1,"body":{"svc":"v1"}}
 ```
 
 请求头语义：`X-Caller-Id` 声明调用方（缺省 `anonymous`）；
 `X-Accept-Versions` 为逗号分隔的可接受版本（缺省接受任意版本）。
+
+本地演示装配（`gateway/app.py: build_gateway`）已带上新能力的样例配置，可直接观察：
+
+- 灰度权重：`get-item` 的 v1/v2 = 90/10，同一 `X-Caller-Id` 反复请求落点稳定，
+  换个调用方可能落到另一版本；
+- 共享容量：`items-v2a` 总量 64 并发，调用方 `vip`（优先级 1）预留 16；
+- 灰度联动：熔断打开即把对应版本压零，恢复按 10% → 50% → 100% 分阶段放量。
+
+新行为的端到端验证以单测为准：`uv run pytest tests/test_weights.py
+tests/test_capacity.py tests/test_canary.py tests/test_gateway_gray.py -v`。
 
 ## 路由与版本规则
 
@@ -60,6 +70,56 @@ curl -H 'X-Caller-Id: demo' -H 'X-Accept-Versions: 1,2' http://127.0.0.1:8000/it
 - 上游业务错误（4xx/5xx）说明上游已应答，不做切换，直接归一化返回；
 - 上游 5xx 计入熔断失败，4xx 视为上游健康。
 
+## 灰度发布：加权分流与调用方粘性
+
+每个 `(路由, 版本)` 可配置一个非负整数权重（`WeightManager`），新请求在
+「调用方可接受的版本」范围内按权重分流：
+
+- **确定性分桶**：`sha256(路由, 调用方) mod 总权重` 决定落点，不依赖随机数，
+  也不受 Python 哈希随机化影响，同一输入跨进程、跨次运行结果一致。
+- **调用方粘性**：权重不变时同一调用方永远落到同一版本，幂等重试与故障切换的
+  判定前后一致；权重调整后只影响新请求的判定，部分调用方确定性地迁移。
+- **运行期调整**：`update_weights` 以不可变快照整体替换，替换后对新请求立刻生效；
+  已在处理中的请求按进入时选定的版本走完，不存在半新半旧的中间状态。
+- **权重为 0**：该版本不接新请求（摘流），在途请求正常收尾。
+- 未配置 `WeightManager` 时保持旧行为：取可接受的最高版本。
+- 可接受版本的有效权重全为 0 时返回 `upstream_unavailable`（503，可重试）。
+
+## 上游共享容量与优先级
+
+限流管的是「某个调用方打某个路由」，挡不住多个调用方一起把同一个上游打满。
+`CapacityManager` 在上游实例这一层加总容量保护，所有调用方共享：
+
+- 容量按上游实例的**在途请求数**计量（`acquire`/`release`），检查与计数在同一把锁内
+  完成，并发下不超发；在途请求任何情况下都不被中途掐断。
+- `CapacityRule(total_slots, reserved)`：`total_slots` 为共享总量，
+  `reserved` 为「优先级 → 预留额度」（预留之和不得超过总量）。
+- **预留与借用**：占用自有预留始终优先；预留没用完的部分允许其他优先级临时借用，
+  但总在途不超过 `total_slots`。
+- **回收（reclaim）**：高优先级回来而额度被借满时，其请求被拒（可重试）并记录一个
+  有效期为 `reclaim_window_seconds` 的回收标记；标记有效期内更低优先级的新借用请求
+  一律被拒（让路），在途请求正常收尾后额度自然归还给高优先级。高优先级占回预留后
+  标记清除；标记过期而高优先级未回来，则低优先级恢复借用。
+- **快照语义**：`update_rules` 整体替换规则与调用方优先级映射；在途计数按
+  `(上游, 优先级)` 独立记账，规则替换后在途请求仍归还到正确的桶，账不会记混。
+- 无规则的上游默认放行。被容量拦下的请求**未发出**，网关在主备上游间可安全切换；
+  所有上游都满时才以 `upstream_capacity_exhausted` 拒绝。
+
+## 灰度与健康保护联动
+
+`CanaryController` 订阅熔断器状态事件，按 `(路由, 版本)` 自动调节有效权重：
+
+1. **自动回退**：版本任一上游熔断进入 OPEN（连续失败达阈值）→ 该版本有效权重
+   立即压到 0（SUPPRESSED），新流量全部落回其余版本（如稳定版）。
+2. **分阶段恢复**：压零满 `recovery_seconds` 后进入 RECOVERING，按 `ramp` 比例
+   （如 `10% → 50% → 100%`）逐级放量；每级须稳定经过 `stage_dwell_seconds`
+   （期间无新的熔断事件）才升入下一级，全部完成回到 NORMAL 恢复基础权重。
+3. **试探失败立即退回**：恢复期间任一上游再次 OPEN → 立即压零并重新计时。
+4. **不被迟到的成功误导**：恢复进度只由时钟与「无新 OPEN 事件」推进，
+   CLOSED 事件被有意忽略，一个迟到的成功结果不会把状态提前放开。
+
+整个过程由「熔断事件 + 注入时钟」驱动，同样的输入序列每次运行结果一致（可复现）。
+
 ## 错误分类
 
 所有底层异常在网关边界归一化为 `GatewayError`，不向调用方透出：
@@ -68,8 +128,9 @@ curl -H 'X-Caller-Id: demo' -H 'X-Accept-Versions: 1,2' http://127.0.0.1:8000/it
 | --- | --- | --- | --- |
 | `route_not_found` | 404 | 无匹配路由 | 否 |
 | `version_not_satisfied` | 406 | 版本协商失败 | 否 |
-| `rate_limited` | 429 | 突发超限 | 是 |
-| `quota_exhausted` | 429 | 配额耗尽 | 否 |
+| `rate_limited` | 429 | 调用方突发超限 | 是 |
+| `quota_exhausted` | 429 | 调用方配额耗尽 | 否 |
+| `upstream_capacity_exhausted` | 503 | 上游共享容量占满（所有调用方） | 是 |
 | `circuit_open` | 503 | 熔断/半开拒绝 | 是 |
 | `upstream_timeout` | 504 | 上游超时 | 是 |
 | `upstream_unavailable` | 503 | 上游不可用 | 是 |
@@ -82,7 +143,9 @@ curl -H 'X-Caller-Id: demo' -H 'X-Accept-Versions: 1,2' http://127.0.0.1:8000/it
 - `MockUpstream` 用 `Behavior` 脚本化每次调用的表现（ok/timeout/unavailable/error + 模拟延迟），
   延迟通过推进共享时钟体现；`call_count` 用于断言非幂等请求未被重复执行。
 - 覆盖：并发限流原子性、幂等/非幂等故障切换、熔断状态迁移（含半开探测成功/失败）、
-  版本协商失败、HTTP 层错误映射。测试日志（`log_cli`）打印关键输入与判定依据。
+  版本协商失败、HTTP 层错误映射、权重分流的确定性与调用方粘性、
+  共享容量并发原子性与优先级预留的占用/借用/归还、灰度自动回退与分阶段恢复。
+  测试日志（`log_cli`）打印关键输入与判定依据。
 
 ## 代码结构
 
@@ -93,9 +156,12 @@ gateway/
   models.py     路由、版本、上游、请求/响应模型
   router.py     路径模板匹配与版本协商
   ratelimit.py  原子限流与配额（快照式规则替换）
-  circuit.py    熔断状态机
+  weights.py    加权分流与调用方粘性（快照式权重替换）
+  capacity.py   上游共享容量：优先级预留 + 借用 + 回收
+  circuit.py    熔断状态机（含状态变更监听）
+  canary.py     灰度与熔断联动：自动回退与分阶段恢复
   upstreams.py  可脚本化的模拟上游
-  gateway.py    编排：路由→限流→熔断→调用→故障切换→错误归一化
+  gateway.py    编排：路由→加权选版→限流→容量→熔断→调用→故障切换→错误归一化
   app.py        FastAPI 暴露层与演示装配
 main.py         本地运行入口
 tests/          单元与集成测试

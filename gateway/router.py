@@ -53,8 +53,8 @@ class Router:
             f"no route for {request.method.value} {request.path}",
         )
 
-    def select_version(self, route: Route, caller: Caller) -> RouteVersion:
-        """在调用方可接受版本内确定性选择最高版本；无法满足抛 VERSION_NOT_SATISFIED。"""
+    def candidate_versions(self, route: Route, caller: Caller) -> list[RouteVersion]:
+        """调用方可接受的版本列表（按版本号升序）；交集为空抛 VERSION_NOT_SATISFIED。"""
         offered = sorted(v.version for v in route.versions)
         acceptable = (
             [v for v in route.versions if v.version in caller.accepted_versions]
@@ -67,4 +67,8 @@ class Router:
                 f"caller '{caller.caller_id}' accepts {sorted(caller.accepted_versions)} "
                 f"but route '{route.route_id}' offers {offered}",
             )
-        return max(acceptable, key=lambda v: v.version)
+        return sorted(acceptable, key=lambda v: v.version)
+
+    def select_version(self, route: Route, caller: Caller) -> RouteVersion:
+        """在调用方可接受版本内确定性选择最高版本；无法满足抛 VERSION_NOT_SATISFIED。"""
+        return max(self.candidate_versions(route, caller), key=lambda v: v.version)
